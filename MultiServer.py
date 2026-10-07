@@ -210,6 +210,7 @@ class Client(Endpoint):
         "auth",
         "team",
         "slot",
+        "spectator",
         "send_index",
         "tags",
         "messageprocessor",
@@ -225,6 +226,7 @@ class Client(Endpoint):
     auth: bool
     team: int | None
     slot: int | None
+    spectator: bool
     send_index: int
     tags: list[str]
     messageprocessor: ClientMessageProcessor
@@ -241,6 +243,7 @@ class Client(Endpoint):
         self.auth = False
         self.team = None
         self.slot = None
+        self.spectator = False
         self.send_index = 0
         self.tags = []
         self.messageprocessor = client_message_processor(ctx, self)
@@ -267,6 +270,8 @@ class Client(Endpoint):
 
     @property
     def name(self) -> str:
+        if self.spectator:
+            return "Spectator"
         ctx = self.ctx()
         if ctx:
             return ctx.player_names[self.team, self.slot]
@@ -342,6 +347,7 @@ class Context:
         self.log_network = log_network
         self.endpoints = []
         self.clients = {}
+        self.spectators = []
         self.compatibility: int = compatibility
         self.shutdown_task = None
         self.data_filename = None
@@ -386,7 +392,6 @@ class Context:
         self.save_dirty = False
         self.tags = ['AP']
         self.games: typing.Dict[int, str] = {}
-        self.played_games = set()
         self.minimum_client_versions: typing.Dict[int, Version] = {}
         self.seed_name = ""
         self.groups = {}
@@ -396,10 +401,9 @@ class Context:
         self.stored_data_notification_clients = collections.defaultdict(weakref.WeakSet)
         self.read_data = {}
         self.spheres = []
-        self.games_package_cache = games_package_cache or GamesPackageCache()
 
         # init empty to satisfy linter, I suppose
-        self.reduced_games_package = {}
+        self.gamespackage = {}
         self.checksums = {}
         self.item_name_groups = {}
         self.location_name_groups = {}
@@ -481,7 +485,7 @@ class Context:
         data = self.dumper(msgs)
         endpoints = (
             endpoint
-            for endpoint in itertools.chain.from_iterable(self.clients[team].values())
+            for endpoint in itertools.chain.from_iterable((*self.clients[team].values(), self.spectators))
             if not (msg_is_text and endpoint.no_text)
         )
         async_start(self.broadcast_send_encoded_msgs(endpoints, data))
@@ -493,6 +497,8 @@ class Context:
     async def disconnect(self, endpoint: Client):
         if endpoint in self.endpoints:
             self.endpoints.remove(endpoint)
+        if endpoint in self.spectators:
+            self.spectators.remove(endpoint)
         if endpoint.slot and endpoint in self.clients[endpoint.team][endpoint.slot]:
             self.clients[endpoint.team][endpoint.slot].remove(endpoint)
         await on_client_disconnected(self, endpoint)
@@ -897,13 +903,16 @@ class Context:
         if not hints:
             return
         new_hint_events: typing.Set[int] = set()
-        concerns = collections.defaultdict(list)
+        player_concerns = collections.defaultdict(list)
+        spectator_concerns = []
         for hint in sorted(hints, key=operator.attrgetter('found'), reverse=True):
             data = (hint, hint.as_network_message())
             for player in self.slot_set(hint.receiving_player):
-                concerns[player].append(data)
-            if not hint.local and data not in concerns[hint.finding_player]:
-                concerns[hint.finding_player].append(data)
+                player_concerns[player].append(data)
+            if not hint.local and data not in player_concerns[hint.finding_player]:
+                player_concerns[hint.finding_player].append(data)
+            if data not in spectator_concerns:
+                spectator_concerns.append(data)
 
             # For !hint use cases, only hints that were not already found at the time of creation should be remembered
             # For LocationScouts use-cases, all hints should be remembered
@@ -920,7 +929,7 @@ class Context:
             self.logger.info("Notice (Team #%d): %s" % (team + 1, format_hint(self, team, hint)))
         for slot in new_hint_events:
             self.on_new_hint(team, slot)
-        for slot, hint_data in concerns.items():
+        for slot, hint_data in player_concerns.items():
             if recipients is None or slot in recipients:
                 clients = filter(lambda c: not c.no_text, self.clients[team].get(slot, []))
                 if not clients:
@@ -928,6 +937,12 @@ class Context:
                 client_hints = [datum[1] for datum in sorted(hint_data, key=lambda x: x[0].finding_player != slot)]
                 for client in clients:
                     async_start(self.send_msgs(client, client_hints))
+                    
+        spectator_hints = [datum[1] for datum in spectator_concerns]
+        if spectator_hints:
+            for spectator in self.spectators:
+                if not spectator.no_text:
+                    async_start(self.send_msgs(spectator, spectator_hints))
 
     def get_hint(self, team: int, finding_player: int, seeked_location: int) -> typing.Optional[Hint]:
         for hint in self.hints[team, finding_player]:
@@ -1053,11 +1068,18 @@ async def on_client_joined(ctx: Context, client: Client):
     else:
         final_verb = "playing"
 
-    ctx.broadcast_text_all(
-        f"{ctx.get_aliased_name(client.team, client.slot)} (Team #{client.team + 1}) "
-        f"{final_verb} {ctx.games[client.slot]} has joined. "
-        f"Client({version_str}), {client.tags}.",
-        {"type": "Join", "team": client.team, "slot": client.slot, "tags": client.tags})
+    if client.spectator:
+        ctx.broadcast_text_all(
+        f"Spectator has joined. {client.tags}.",
+        {"type": "Join", "tags": client.tags})
+    else:
+        ctx.broadcast_text_all(
+            f"{ctx.get_aliased_name(client.team, client.slot)} (Team #{client.team + 1}) "
+            f"{final_verb} {ctx.games[client.slot]} has joined. "
+            f"Client({version_str}), {client.tags}.",
+            {"type": "Join", "team": client.team, "slot": client.slot, "tags": client.tags})
+        ctx.client_connection_timers[client.team, client.slot] = datetime.datetime.now(datetime.timezone.utc)
+        
     ctx.notify_client(client, "Now that you are connected, "
                               "you can use !help to list commands to run via the server. "
                               "If your client supports it, "
@@ -1067,13 +1089,12 @@ async def on_client_joined(ctx: Context, client: Client):
         ctx.notify_client(client, "Warning: your client does not support compressed websocket connections! "
                                   "It may stop working in the future. If you are a player, please report this to the "
                                   "client's developer.")
-    ctx.client_connection_timers[client.team, client.slot] = datetime.datetime.now(datetime.timezone.utc)
-
 
 async def on_client_left(ctx: Context, client: Client):
     if len(ctx.clients[client.team][client.slot]) < 1:
         update_client_status(ctx, client, ClientStatus.CLIENT_UNKNOWN)
-        ctx.client_connection_timers[client.team, client.slot] = datetime.datetime.now(datetime.timezone.utc)
+        if not client.spectator:
+            ctx.client_connection_timers[client.team, client.slot] = datetime.datetime.now(datetime.timezone.utc)
 
     version_str = '.'.join(str(x) for x in client.version)
 
@@ -1084,10 +1105,15 @@ async def on_client_left(ctx: Context, client: Client):
     else:
         final_verb = "left"
 
-    ctx.broadcast_text_all(
-        f"{ctx.get_aliased_name(client.team, client.slot)} (Team #{client.team + 1}) has {final_verb} the game. "
-        f"Client({version_str}), {client.tags}.",
-        {"type": "Part", "team": client.team, "slot": client.slot})
+    if client.spectator:
+        ctx.broadcast_text_all(
+            f"Spectator has {final_verb} the game. {client.tags}.",
+            {"type": "Part"})
+    else:
+        ctx.broadcast_text_all(
+            f"{ctx.get_aliased_name(client.team, client.slot)} (Team #{client.team + 1}) has {final_verb} the game. "
+            f"Client({version_str}), {client.tags}.",
+            {"type": "Part", "team": client.team, "slot": client.slot})
 
 
 async def countdown(ctx: Context, timer: int):
@@ -1106,7 +1132,7 @@ async def countdown(ctx: Context, timer: int):
 
 
 def get_players_string(ctx: Context):
-    auth_clients = {(c.team, c.slot) for c in ctx.endpoints if c.auth}
+    auth_clients = {(c.team, c.slot) for c in ctx.endpoints if c.auth and not c.spectator}
 
     player_names = sorted(ctx.player_names.keys())
     current_team = -1
@@ -1961,13 +1987,16 @@ async def process_client_cmd(ctx: Context, client: Client, args: dict):
         if ctx.password and args['password'] != ctx.password:
             errors.add('InvalidPassword')
 
-        if args['name'] not in ctx.connect_names:
-            errors.add('InvalidSlot')
+        if ("name" not in args.keys() or args['name'] not in ctx.connect_names) and ("spectator" not in args.keys() or not args['spectator']):
+            errors.add('InvalidSlot')      
         else:
-            team, slot = ctx.connect_names[args['name']]
-            game = ctx.games[slot]
+            if "spectator" in args.keys() and args['spectator']:
+                ignore_game = True
+            else:
+                team, slot = ctx.connect_names[args['name']]
+                game = ctx.games[slot]
 
-            ignore_game = not args.get("game") and any(tag in _non_game_messages for tag in args["tags"])
+                ignore_game = not args.get("game") and any(tag in _non_game_messages for tag in args["tags"])
 
             if not ignore_game and args['game'] != game:
                 errors.add('InvalidGame')
@@ -1986,41 +2015,54 @@ async def process_client_cmd(ctx: Context, client: Client, args: dict):
             ctx.logger.info(f"A client connection was refused due to: {errors}, the sent connect information was {args}.")
             await ctx.send_msgs(client, [{"cmd": "ConnectionRefused", "errors": list(errors)}])
         else:
-            team, slot = ctx.connect_names[args['name']]
-            if client.auth and client.team is not None and client.slot in ctx.clients[client.team]:
-                ctx.clients[team][slot].remove(client)  # re-auth, remove old entry
-                if client.team != team or client.slot != slot:
-                    client.auth = False  # swapping Team/Slot
-            client.team = team
-            client.slot = slot
+            if "spectator" in args.keys() and args['spectator']:
+                client.spectator = True
+                ctx.spectators.append(client)
+            else:
+                team, slot = ctx.connect_names[args['name']]
+                if client.auth and client.team is not None and client.slot in ctx.clients[client.team]:
+                    ctx.clients[team][slot].remove(client)  # re-auth, remove old entry
+                    if client.team != team or client.slot != slot:
+                        client.auth = False  # swapping Team/Slot
+                client.team = team
+                client.slot = slot
 
-            ctx.client_ids[client.team, client.slot] = args["uuid"]
-            ctx.clients[team][slot].append(client)
+                ctx.client_ids[client.team, client.slot] = args["uuid"]
+                ctx.clients[team][slot].append(client)
             client.version = args['version']
             client.tags = args['tags']
             client.no_locations = bool(client.tags & _non_game_messages.keys())
             # set NoText for old PopTracker clients that predate the tag to save traffic
             client.no_text = "NoText" in client.tags or ("PopTracker" in client.tags and client.version < (0, 5, 1))
-            connected_packet = {
-                "cmd": "Connected",
-                "team": client.team, "slot": client.slot,
-                "players": ctx.get_players_package(),
-                "missing_locations": get_missing_checks(ctx, team, slot),
-                "checked_locations": get_checked_checks(ctx, team, slot),
-                "slot_info": ctx.slot_info,
-                "hint_points": get_slot_points(ctx, team, slot),
-            }
-            reply = [connected_packet]
-            start_inventory = get_start_inventory(ctx, slot, client.remote_start_inventory)
-            items = get_received_items(ctx, client.team, client.slot, client.remote_items)
-            if (start_inventory or items) and not client.no_items:
-                reply.append({"cmd": 'ReceivedItems', "index": 0, "items": start_inventory + items})
-                client.send_index = len(start_inventory) + len(items)
-            if not client.auth:  # if this was a Re-Connect, don't print to console
-                client.auth = True
-                await on_client_joined(ctx, client)
-            if args.get("slot_data", True):
-                connected_packet["slot_data"] = ctx.slot_data[client.slot]
+            
+            if "spectator" in args.keys() and args['spectator']:
+                connected_packet = {
+                    "cmd": "Connected",
+                    "players": ctx.get_players_package(),
+                    "slot_info": ctx.slot_info,
+                }
+                reply = [connected_packet]
+            else:
+                connected_packet = {
+                    "cmd": "Connected",
+                    "team": client.team, "slot": client.slot,
+                    "players": ctx.get_players_package(),
+                    "missing_locations": get_missing_checks(ctx, team, slot),
+                    "checked_locations": get_checked_checks(ctx, team, slot),
+                    "slot_info": ctx.slot_info,
+                    "hint_points": get_slot_points(ctx, team, slot),
+                }
+                reply = [connected_packet]
+                start_inventory = get_start_inventory(ctx, slot, client.remote_start_inventory)
+                items = get_received_items(ctx, client.team, client.slot, client.remote_items)
+                if (start_inventory or items) and not client.no_items:
+                    reply.append({"cmd": 'ReceivedItems', "index": 0, "items": start_inventory + items})
+                    client.send_index = len(start_inventory) + len(items)
+                if not client.auth:  # if this was a Re-Connect, don't print to console
+                    client.auth = True
+                    await on_client_joined(ctx, client)
+                if args.get("slot_data", True):
+                    connected_packet["slot_data"] = ctx.slot_data[client.slot]
             await ctx.send_msgs(client, reply)
 
     elif cmd == "GetDataPackage":
