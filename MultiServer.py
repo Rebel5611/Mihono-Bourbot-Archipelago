@@ -401,9 +401,10 @@ class Context:
         self.stored_data_notification_clients = collections.defaultdict(weakref.WeakSet)
         self.read_data = {}
         self.spheres = []
-
+        self.games_package_cache = games_package_cache or GamesPackageCache()
+        
         # init empty to satisfy linter, I suppose
-        self.gamespackage = {}
+        self.reduced_games_package = {}
         self.checksums = {}
         self.item_name_groups = {}
         self.location_name_groups = {}
